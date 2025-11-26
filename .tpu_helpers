@@ -1,0 +1,428 @@
+# Config directory for tpusetup; override with TPU_SETUP_CONFIG_DIR before sourcing.
+: "${TPU_SETUP_CONFIG_DIR:=$HOME/.tpu_setup}"
+
+_tpu_require_env() {
+  local missing=()
+  for var in "$@"; do
+    if [ -z "${!var:-}" ]; then
+      missing+=("$var")
+    fi
+  done
+  if [ ${#missing[@]} -ne 0 ]; then
+    echo "Missing env vars: ${missing[*]}. Run tpusetup first."
+    return 1
+  fi
+}
+
+_tpusetup_prompt_index() {
+  local prompt="$1"
+  local max="$2"
+  local choice
+  while true; do
+    read -rp "$prompt [1-$max]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= max )); then
+      echo $((choice - 1))
+      return 0
+    fi
+    echo "Please enter a number between 1 and $max."
+  done
+}
+
+tpusetup() {
+  # Interactive helper to pick project/zone/TPU type and export env vars.
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required for tpusetup."
+    return 1
+  fi
+
+  local config_dir="${TPU_SETUP_CONFIG_DIR:-$HOME/.tpu_setup}"
+  local projects_file="$config_dir/projects.json"
+  local zones_file="$config_dir/zones.json"
+  local types_file="$config_dir/tpu_types.json"
+
+  for f in "$projects_file" "$zones_file" "$types_file"; do
+    if [ ! -f "$f" ]; then
+      echo "Missing config: $f"
+      echo "Update TPU_SETUP_CONFIG_DIR or add the config files."
+      return 1
+    fi
+  done
+
+  local -a project_keys project_ids
+  while IFS="|" read -r key id; do
+    [ -z "$key" ] && continue
+    project_keys+=("$key")
+    project_ids+=("$id")
+  done < <(python3 - "$projects_file" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for item in data:
+    print(f"{item['key']}|{item['id']}")
+PY
+)
+  if [ ${#project_keys[@]} -eq 0 ]; then
+    echo "No projects configured in $projects_file"
+    return 1
+  fi
+
+  echo "Projects:"
+  for i in "${!project_keys[@]}"; do
+    printf "  [%d] %s (%s)\n" "$((i + 1))" "${project_keys[$i]}" "${project_ids[$i]}"
+  done
+  local project_idx
+  project_idx=$(_tpusetup_prompt_index "Select a project" "${#project_keys[@]}") || return 1
+  local selected_project_key="${project_keys[$project_idx]}"
+  local selected_project_id="${project_ids[$project_idx]}"
+
+  local -a type_families type_names type_runtimes
+  while IFS="|" read -r family type runtime; do
+    [ -z "$family" ] && continue
+    type_families+=("$family")
+    type_names+=("$type")
+    type_runtimes+=("$runtime")
+  done < <(python3 - "$types_file" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for item in data:
+    print(f"{item['family']}|{item['type']}|{item['runtime']}")
+PY
+)
+  if [ ${#type_names[@]} -eq 0 ]; then
+    echo "No TPU types configured in $types_file"
+    return 1
+  fi
+
+  echo "TPU types:"
+  for i in "${!type_names[@]}"; do
+    printf "  [%d] %s (runtime %s)\n" "$((i + 1))" "${type_names[$i]}" "${type_runtimes[$i]}"
+  done
+  local type_idx
+  type_idx=$(_tpusetup_prompt_index "Select a TPU type" "${#type_names[@]}") || return 1
+  local selected_family="${type_families[$type_idx]}"
+  local selected_type="${type_names[$type_idx]}"
+  local selected_runtime="${type_runtimes[$type_idx]}"
+
+  local -a zone_keys zone_values
+  while IFS="|" read -r family key zone; do
+    [ -z "$family" ] && continue
+    if [ "$family" = "$selected_family" ]; then
+      zone_keys+=("$key")
+      zone_values+=("$zone")
+    fi
+  done < <(python3 - "$zones_file" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for item in data:
+    print(f"{item['family']}|{item['key']}|{item['zone']}")
+PY
+)
+  if [ ${#zone_keys[@]} -eq 0 ]; then
+    echo "No zones configured for TPU type $selected_type in $zones_file"
+    return 1
+  fi
+
+  echo "Zones for $selected_type:"
+  for i in "${!zone_keys[@]}"; do
+    printf "  [%d] %s (%s)\n" "$((i + 1))" "${zone_keys[$i]}" "${zone_values[$i]}"
+  done
+  local zone_idx
+  zone_idx=$(_tpusetup_prompt_index "Select a zone" "${#zone_keys[@]}") || return 1
+  local selected_zone="${zone_values[$zone_idx]}"
+  local selected_zone_key="${zone_keys[$zone_idx]}"
+
+  export TPU_PROJECT_KEY="$selected_project_key"
+  export TPU_PROJECT_ID="$selected_project_id"
+  export CLOUDSDK_CORE_PROJECT="$selected_project_id"
+  export TPU_TYPE="$selected_type"
+  export TPU_RUNTIME="$selected_runtime"
+  export TPU_RUNTIME_VERSION="$selected_runtime"
+  export TPU_ZONE="$selected_zone"
+  export CLOUDSDK_COMPUTE_ZONE="$selected_zone"
+
+  local base_name="spot-tpu-${selected_type}-${selected_zone_key}"
+  local idx
+  while true; do
+    read -rp "TPU index to append to '$base_name' (optional number, Enter to skip): " idx
+    if [ -z "$idx" ]; then
+      break
+    fi
+    if [[ "$idx" =~ ^[0-9]+$ ]]; then
+      base_name="${base_name}-${idx}"
+      break
+    fi
+    echo "Index must be numeric."
+  done
+
+  read -rp "TPU name (press Enter to use '$base_name'): " new_name
+  if [ -n "$new_name" ]; then
+    export TPU_NAME="$new_name"
+  else
+    export TPU_NAME="$base_name"
+  fi
+
+  echo "Configured environment:"
+  echo "  project: $CLOUDSDK_CORE_PROJECT ($TPU_PROJECT_KEY)"
+  echo "  zone:    $CLOUDSDK_COMPUTE_ZONE"
+  echo "  type:    $TPU_TYPE"
+  echo "  runtime: $TPU_RUNTIME_VERSION"
+  if [ -n "$TPU_NAME" ]; then
+    echo "  TPU_NAME: $TPU_NAME"
+  fi
+}
+
+tshow() {
+  echo "TPU setup:"
+  printf "  config dir: %s\n" "${TPU_SETUP_CONFIG_DIR:-$HOME/.tpu_setup}"
+  printf "  project id: %s\n" "${CLOUDSDK_CORE_PROJECT:-unset}"
+  printf "  project key: %s\n" "${TPU_PROJECT_KEY:-unset}"
+  printf "  zone: %s\n" "${CLOUDSDK_COMPUTE_ZONE:-unset}"
+  printf "  type: %s\n" "${TPU_TYPE:-unset}"
+  printf "  runtime: %s\n" "${TPU_RUNTIME_VERSION:-${TPU_RUNTIME:-unset}}"
+  printf "  TPU_NAME: %s\n" "${TPU_NAME:-unset}"
+}
+
+# gcloud related shortcuts
+tcreate() {
+  _tpu_require_env TPU_NAME TPU_TYPE TPU_RUNTIME_VERSION TPU_ZONE TPU_PROJECT_ID || return 1
+  local zone="${CLOUDSDK_COMPUTE_ZONE:-$TPU_ZONE}"
+  local project="${CLOUDSDK_CORE_PROJECT:-$TPU_PROJECT_ID}"
+  local runtime="${TPU_RUNTIME_VERSION:-$TPU_RUNTIME}"
+  local cmd=(
+    gcloud compute tpus queued-resources create "$TPU_NAME"
+    "--node-id=$TPU_NAME"
+    "--accelerator-type=$TPU_TYPE"
+    "--runtime-version=$runtime"
+    "--spot"
+    "--quiet"
+    "--zone=$zone"
+    "--project=$project"
+  )
+  echo "About to run:"
+  printf "  %s\n" "${cmd[*]}"
+  read -rp "Proceed? [y/N]: " confirm
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    return 1
+  fi
+  "${cmd[@]}"
+}
+
+tdelete() {
+  _tpu_require_env TPU_NAME TPU_ZONE TPU_PROJECT_ID || return 1
+  local zone="${CLOUDSDK_COMPUTE_ZONE:-$TPU_ZONE}"
+  local project="${CLOUDSDK_CORE_PROJECT:-$TPU_PROJECT_ID}"
+  local cmd=(
+    gcloud compute tpus queued-resources delete "$TPU_NAME"
+    "--force"
+    "--quiet"
+    "--zone=$zone"
+    "--project=$project"
+  )
+  echo "About to run:"
+  printf "  %s\n" "${cmd[*]}"
+  read -rp "Proceed? [y/N]: " confirm
+  if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+    echo "Aborted."
+    return 1
+  fi
+  "${cmd[@]}"
+}
+
+tpuscp() {
+  if [ -z "$1" ]; then
+    echo "Error: You must provide a file name (e.g., train.py)." >&2
+    return 1
+  fi
+
+  # The local file is $1. The remote path is constructed using $1.
+  # Quotes are used around $TPU_NAME and $1 to handle spaces or special characters.
+  gcloud compute tpus tpu-vm scp "$1" "$TPU_NAME:~/picoscale/$1" --worker=all
+}
+
+tpuscpv() {
+  if [ -z "$1" ]; then
+    echo "Error: You must provide a file name (e.g., train.py)." >&2
+    return 1
+  fi
+  # Copy without assuming picoscale path.
+  gcloud compute tpus tpu-vm scp "$1" "$TPU_NAME:~/$1" --worker=all
+}
+
+tpurscp() {
+  if [ -z "$1" ]; then
+    echo "Error: You must provide a file name (e.g., train.py)." >&2
+    return 1
+  fi
+
+  WORKER=${2:-all}
+
+  # The local file is $1. The remote path is constructed using $1.
+  # Quotes are used around $TPU_NAME and $1 to handle spaces or special characters.
+  gcloud compute tpus tpu-vm scp --recurse "$TPU_NAME:~/picoscale/$1" "$1" --worker=$WORKER
+}
+# Function to SSH to all TPU workers, activate the environment,
+# navigate to 'picoscale', and execute the provided command ($1)
+
+tpurun() {
+  if [ -z "$1" ]; then
+    echo "Error: You must provide a command to run (e.g., 'python train.py')." >&2
+    return 1
+  fi
+
+  # The command to execute on the remote machine is constructed here.
+  # Note the use of single quotes for the main command string and
+  # escaped double quotes around $1 to handle complex commands.
+  gcloud compute tpus tpu-vm ssh "$TPU_NAME" --worker=all --command='
+    source ./miniconda/etc/profile.d/conda.sh;
+    conda activate jax_tpu;
+    cd picoscale;
+    '"$1"'
+  '
+}
+
+# Usage: tcheckout <GIT_HASH | "latest">
+# Reads TPU_NAME from the environment variable $TPU_NAME.
+tcheckout() {
+  # Argument and Environment Variable Checks
+  [ -z "$TPU_NAME" ] && echo "🚨 Error: TPU_NAME env var not set." && return 1
+  [ -z "$1" ] && echo "🚨 Error: Usage: tcheckout <GIT_HASH | latest>" && return 1
+
+  local GIT_HASH="$1"
+  local FINAL_HASH="$GIT_HASH"
+
+  # Resolve "latest" locally
+  if [ "$GIT_HASH" == "latest" ]; then
+    if ! git rev-parse --is-inside-work-tree > /dev/null 2>&1; then
+      echo "⚠️ Warning: Not in a git repo. Cannot resolve 'latest'." && return 1
+    fi
+    FINAL_HASH=$(git rev-parse --short HEAD)
+    [ -z "$FINAL_HASH" ] && echo "❌ Error: Failed to retrieve local git hash." && return 1
+    echo "✨ Resolved 'latest' to local short hash: $FINAL_HASH"
+  fi
+
+  echo "🚀 Updating TPU '$TPU_NAME' to hash '$FINAL_HASH'..."
+
+  # Execute the gcloud command
+  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+    --worker=all \
+    --command="source ./miniconda/etc/profile.d/conda.sh; \
+               conda activate jax_tpu; \
+               cd picoscale; \
+               git reset --hard HEAD; \
+               git fetch; \
+               git checkout ${FINAL_HASH}"
+
+  # Final status check
+  if [ $? -eq 0 ]; then
+    echo "✅ Success: TPU '$TPU_NAME' updated."
+  else
+    echo "❌ Failure: Update failed for TPU '$TPU_NAME'."
+    return 1
+  fi
+}
+
+# Function to SSH into a TPU VM, activate the jax_tpu environment,
+# navigate to the picoscale directory, and execute a command on all workers.
+# Reads TPU_NAME from the environment variable $TPU_NAME.
+# Usage: trun <COMMAND and all its arguments>
+trun() {
+  # Argument and Environment Variable Checks
+  [ -z "$TPU_NAME" ] && echo "🚨 Error: TPU_NAME env var not set." && return 1
+  [ -z "$*" ] && echo "🚨 Error: Usage: trun <COMMAND and all its arguments>" && return 1
+
+  # Use "$@" to capture ALL arguments
+  local COMMAND="$*"
+
+  # 1. Define the full remote command string
+  local REMOTE_CMD="source ./miniconda/etc/profile.d/conda.sh; conda activate jax_tpu; cd picoscale; ${COMMAND}"
+
+  echo "--------------------------------------------------------"
+  echo "🚀 Running command on TPU '$TPU_NAME' workers:"
+  echo "$REMOTE_CMD"
+  echo "--------------------------------------------------------"
+
+  # 2. Execute the gcloud command
+  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+    --worker=all \
+    --command="${REMOTE_CMD}"
+
+  # Final status check
+  if [ $? -eq 0 ]; then
+    echo "✅ Command execution on TPU '$TPU_NAME' completed successfully."
+  else
+    echo "❌ Command execution on TPU '$TPU_NAME' failed. Check the output for details."
+    return 1
+  fi
+}
+
+# Variant of trun that does not cd into picoscale.
+trunv() {
+  [ -z "$TPU_NAME" ] && echo "🚨 Error: TPU_NAME env var not set." && return 1
+  [ -z "$*" ] && echo "🚨 Error: Usage: trunv <COMMAND and all its arguments>" && return 1
+
+  local COMMAND="$*"
+  local REMOTE_CMD="source ./miniconda/etc/profile.d/conda.sh; conda activate jax_tpu; ${COMMAND}"
+
+  echo "--------------------------------------------------------"
+  echo "🚀 Running command on TPU '$TPU_NAME' workers (no cd):"
+  echo "$REMOTE_CMD"
+  echo "--------------------------------------------------------"
+
+  gcloud compute tpus tpu-vm ssh "$TPU_NAME" \
+    --worker=all \
+    --command="${REMOTE_CMD}"
+
+  if [ $? -eq 0 ]; then
+    echo "✅ Command execution on TPU '$TPU_NAME' completed successfully."
+  else
+    echo "❌ Command execution on TPU '$TPU_NAME' failed. Check the output for details."
+    return 1
+  fi
+}
+
+tssh() {
+  # Check if TPU_NAME is set
+  if [[ -z "$TPU_NAME" ]]; then
+    echo "Error: TPU_NAME environment variable is not set."
+    echo "Usage: export TPU_NAME=your-tpu-name"
+    return 1
+  fi
+
+  # Check if an argument (WORKER_ID) was provided
+  if [[ -z "$1" ]]; then
+    echo "Error: No WORKER_ID provided."
+    echo "Usage: tssh <WORKER_ID>"
+    return 1
+  fi
+
+  # Assign the first argument to WORKER_ID
+  local WORKER_ID=$1
+
+  # Execute the gcloud command
+  echo "Connecting to $TPU_NAME --worker=$WORKER_ID..."
+  gcloud compute tpus tpu-vm ssh $TPU_NAME --worker=$WORKER_ID
+}
+
+tstatus() {
+  _tpu_require_env TPU_NAME TPU_ZONE TPU_PROJECT_ID || return 1
+  local zone="${CLOUDSDK_COMPUTE_ZONE:-$TPU_ZONE}"
+  local project="${CLOUDSDK_CORE_PROJECT:-$TPU_PROJECT_ID}"
+  gcloud compute tpus queued-resources describe "$TPU_NAME" \
+    --format="json(name.basename(), state)" \
+    --zone="$zone" \
+    --project="$project"
+}
+
+tvmstatus() {
+  _tpu_require_env TPU_NAME TPU_ZONE TPU_PROJECT_ID || return 1
+  local zone="${CLOUDSDK_COMPUTE_ZONE:-$TPU_ZONE}"
+  local project="${CLOUDSDK_CORE_PROJECT:-$TPU_PROJECT_ID}"
+  gcloud compute tpus tpu-vm describe "$TPU_NAME" \
+    --format="json(name.basename(), state, health)" \
+    --zone="$zone" \
+    --project="$project"
+}
+

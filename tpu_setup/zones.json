@@ -1,0 +1,6 @@
+[
+  {"family": "6", "key": "eu", "zone": "europe-west4-a"},
+  {"family": "6", "key": "us", "zone": "us-east1-d"},
+  {"family": "5", "key": "eu", "zone": "europe-west4-b"},
+  {"family": "5", "key": "us", "zone": "us-central1-a"}
+]

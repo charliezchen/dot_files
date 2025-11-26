@@ -1,0 +1,5 @@
+[
+  {"family": "6", "type": "v6e-8", "runtime": "v2-alpha-tpuv6e"},
+  {"family": "5", "type": "v5litepod-8", "runtime": "v2-alpha-tpuv5-lite"},
+  {"family": "5", "type": "v5litepod-32", "runtime": "v2-alpha-tpuv5-lite"}
+]
