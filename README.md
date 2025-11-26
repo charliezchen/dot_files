@@ -1,6 +1,4 @@
-### `README.md`
 
-````markdown
 # 🔧 My Dotfiles
 
 My system configuration files, managed using a **Git Bare Repository**. 
@@ -28,7 +26,7 @@ alias config='/usr/bin/git --git-dir=$HOME/.cfg/ --work-tree=$HOME'
 
 # 4. Checkout the content
 config checkout
-````
+```
 
 ### ⚠️ Troubleshooting: "Checkout Failed"
 
